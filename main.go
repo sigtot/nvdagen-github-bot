@@ -6,17 +6,22 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
 
 var secret []byte
 
-const repo = "Nettverkedagen-2"
+const repo = "Nettverksdagen-2"
 const masterBranch = "master"
 const requestLogFileName = "requests.log"
 const webhookLogFileName = "webhooks.log"
 const port = 8000
+const sshUser = "sigtot"
+const sshHost = "nvdagen.no"
+const sshWorkDir = "~/Nettverksdagen-2"
+const deployScript = "autodeploy.sh"
 
 func main() {
 	log.SetFlags(0)
@@ -42,13 +47,11 @@ func main() {
 	http.HandleFunc("/github", func(w http.ResponseWriter, r *http.Request) {
 		handleRequest(w, r, requestLogger, pushEvents)
 	})
-	go handlePushEvents(webhookLogger, pushEvents)
+	go handlePushEvents(webhookLogFile, webhookLogger, pushEvents)
 
-	fmt.Printf("Server listening on port %d\n", port)
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil); err != nil {
 		panic(err)
 	}
-	fmt.Println("Should not get here")
 }
 
 func okOrPanic(err error) {
@@ -58,7 +61,6 @@ func okOrPanic(err error) {
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request, logger *log.Logger, pushEvents chan<- *github.PushEvent) {
-	fmt.Printf("new request\n")
 	payload, err := github.ValidatePayload(r, secret)
 	if err != nil {
 		logger.Printf("Payload validation failed: %s\n", err.Error())
@@ -74,12 +76,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 
 	pushEvent, ok := event.(*github.PushEvent)
 	if !ok {
-		log.Println("Not a push event")
+		logger.Println("Not a push event")
 		return
 	}
 
 	if *pushEvent.Repo.Name != repo {
-		log.Printf("Bad webhook: Expected repo %s but got %s\n", repo, *pushEvent.Repo.Name)
+		logger.Printf("Bad webhook: Expected repo %s but got %s\n", repo, *pushEvent.Repo.Name)
 		w.WriteHeader(http.StatusBadRequest) // Other repos shouldn't show up here, so something is funky
 		return
 	}
@@ -87,7 +89,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request, logger *log.Logger, p
 	pushEvents <- pushEvent
 }
 
-func handlePushEvents(logger *log.Logger, pushEvents <-chan *github.PushEvent) {
+func handlePushEvents(logFile *os.File, logger *log.Logger, pushEvents <-chan *github.PushEvent) {
 	for {
 		pushEvent := <-pushEvents
 		func() {
@@ -96,11 +98,28 @@ func handlePushEvents(logger *log.Logger, pushEvents <-chan *github.PushEvent) {
 			defer logger.Println("----------------------------------------------------------")
 
 			if branch := strings.Split(*pushEvent.Ref, "/")[2]; branch != masterBranch {
-				logger.Printf("Branch is %s and not %s, omitting deploy\n", masterBranch, branch)
+				logger.Printf("Branch is %s and not %s, omitting deploy\n", branch, masterBranch)
 				return
 			}
 
-			logger.Printf("New commit on %s detected. Starting deploy...\n", masterBranch)
+			if err := deployOverSSH(logFile, logger); err != nil {
+				logger.Printf("Could not execute ssh command %s\n", err.Error())
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					logger.Printf("Exit error: %s\n", exitErr.Stderr)
+				}
+			}
 		}()
 	}
+}
+
+func deployOverSSH(logFile *os.File, logger *log.Logger) error {
+	logger.Printf("New commit on %s detected. Starting deploy...\n", masterBranch)
+	cmd := exec.Command(
+		"ssh",
+		fmt.Sprintf("%s@%s", sshUser, sshHost),
+		fmt.Sprintf("cd %s && ./%s", sshWorkDir, deployScript),
+	)
+	cmd.Stdout = logFile
+	err := cmd.Run()
+	return err
 }
